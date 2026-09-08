@@ -173,6 +173,17 @@ const mapAssignmentRule = (r) => ({
   lastAssignedIndex: r.last_assigned_index || 0,
 })
 
+const mapTeamMember = (r) => ({
+  id: r.id,
+  name: r.name,
+  email: r.email,
+  phone: r.phone,
+  avatarColor: r.avatar_color,
+  role: r.role,
+  status: r.status,
+  createdAt: r.created_at,
+})
+
 function throwIfError(error) {
   if (error) throw new Error(error.message || 'Supabase request failed')
 }
@@ -549,6 +560,13 @@ let MOCK_AGENTS = [
   },
 ]
 
+let MOCK_TEAM_MEMBERS = [
+  { id: uid('tm'), name: 'Maria Chen', email: 'maria@pipelinehq.demo', phone: '(300) 555-0101', avatarColor: '#0EA5A5', role: 'owner', status: 'active', createdAt: new Date(Date.now() - 200 * 86400000).toISOString() },
+  { id: uid('tm'), name: 'James Okafor', email: 'james@pipelinehq.demo', phone: '(300) 555-0102', avatarColor: '#6D5EF5', role: 'admin', status: 'active', createdAt: new Date(Date.now() - 140 * 86400000).toISOString() },
+  { id: uid('tm'), name: 'Priya Patel', email: 'priya@pipelinehq.demo', phone: '(300) 555-0103', avatarColor: '#F5A623', role: 'agent', status: 'active', createdAt: new Date(Date.now() - 80 * 86400000).toISOString() },
+  { id: uid('tm'), name: 'Tom Reyes', email: 'tom@pipelinehq.demo', phone: '(300) 555-0104', avatarColor: '#EF5A6F', role: 'agent', status: 'invited', createdAt: new Date(Date.now() - 2 * 86400000).toISOString() },
+]
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -635,6 +653,86 @@ export const dataService = {
     })
   },
 
+  // Bulk-imports contacts parsed from a spreadsheet (see ImportContacts.jsx).
+  // `rows` is an array of { name, email, phone, owner, tags, stage, source }
+  // already mapped from the sheet's columns. Rows missing a name are the
+  // caller's responsibility to filter out before calling this.
+  //
+  // De-dupes against existing contacts by email (case-insensitive) so
+  // re-uploading the same sheet, or one with overlapping rows, doesn't create
+  // duplicate contacts — matching how GoHighLevel's importer skips existing
+  // matches rather than erroring the whole batch out.
+  //
+  // Returns { imported, skipped, errors } — a per-batch summary, not per-row,
+  // to keep this cheap for large sheets.
+  async importContacts(rows) {
+    const clean = rows
+      .filter((r) => r.name && r.name.trim())
+      .map((r) => ({
+        name: r.name.trim(),
+        email: (r.email || '').trim() || null,
+        phone: (r.phone || '').trim() || null,
+        owner: (r.owner || '').trim() || null,
+        tags: Array.isArray(r.tags) ? r.tags : (r.tags ? String(r.tags).split(',').map((t) => t.trim()).filter(Boolean) : []),
+        stage: STAGES.some((s) => s.id === r.stage) ? r.stage : 'new',
+        source: (r.source || 'Import').trim(),
+        avatar_color: ['#0EA5A5', '#6D5EF5', '#F5A623', '#EF5A6F', '#2F86EB'][Math.floor(Math.random() * 5)],
+        last_activity: 'Just imported',
+      }))
+
+    if (supabase) {
+      const { data: existing, error: fetchError } = await supabase.from('contacts').select('email')
+      throwIfError(fetchError)
+      const existingEmails = new Set((existing || []).map((e) => (e.email || '').toLowerCase()).filter(Boolean))
+
+      const seen = new Set()
+      const toInsert = []
+      let skipped = 0
+      for (const row of clean) {
+        const key = row.email ? row.email.toLowerCase() : null
+        if (key && (existingEmails.has(key) || seen.has(key))) {
+          skipped++
+          continue
+        }
+        if (key) seen.add(key)
+        toInsert.push(row)
+      }
+
+      const errors = []
+      const CHUNK = 500
+      let imported = 0
+      for (let i = 0; i < toInsert.length; i += CHUNK) {
+        const chunk = toInsert.slice(i, i + CHUNK)
+        const { error } = await supabase.from('contacts').insert(chunk)
+        if (error) errors.push(error.message)
+        else imported += chunk.length
+      }
+
+      return { imported, skipped, errors }
+    }
+
+    await wait(400)
+    const existingEmails = new Set(MOCK_CONTACTS.map((c) => (c.email || '').toLowerCase()).filter(Boolean))
+    const seen = new Set()
+    let imported = 0
+    let skipped = 0
+    for (const row of clean) {
+      const key = row.email ? row.email.toLowerCase() : null
+      if (key && (existingEmails.has(key) || seen.has(key))) {
+        skipped++
+        continue
+      }
+      if (key) seen.add(key)
+      MOCK_CONTACTS.unshift(mapContact({
+        id: uid('ct'),
+        ...row,
+        created_at: new Date().toISOString(),
+      }))
+      imported++
+    }
+    return { imported, skipped, errors: [] }
+  },
+
   async getDeals() {
     if (supabase) {
       const { data, error } = await supabase.from('deals').select('*').order('created_at', { ascending: false })
@@ -709,6 +807,34 @@ export const dataService = {
       convo.lastTime = 'now'
     }
     return msg
+  },
+
+  subscribeToConversation(conversationId, { onMessage, onConversationUpdate } = {}) {
+    if (!supabase) {
+      console.warn('[dataService] subscribeToConversation: Supabase not configured, skipping realtime.')
+      return () => { }
+    }
+
+    const channel = supabase
+      .channel(`conversation:${conversationId}`)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversationId}` },
+        (payload) => onMessage?.(mapMessage(payload.new))
+      )
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'conversations', filter: `id=eq.${conversationId}` },
+        (payload) => onConversationUpdate?.({
+          id: payload.new.id,
+          unread: payload.new.unread,
+          lastMessage: payload.new.last_message,
+          lastTime: payload.new.last_time,
+        })
+      )
+      .subscribe()
+
+    return () => supabase.removeChannel(channel)
   },
 
   async getFunnels() {
@@ -957,5 +1083,81 @@ export const dataService = {
     if (rule.method === 'specific_user') return rule.assignees[0]
     const nextIndex = (rule.lastAssignedIndex + 1) % rule.assignees.length
     return rule.assignees[nextIndex]
+  },
+
+  // -- Settings: agency team members ----------------------------------------
+
+  async getTeamMembers() {
+    if (supabase) {
+      const { data, error } = await supabase.from('team_members').select('*').order('created_at', { ascending: true })
+      throwIfError(error)
+      return data.map(mapTeamMember)
+    }
+    await wait()
+    return [...MOCK_TEAM_MEMBERS]
+  },
+
+  // Adds a row to the team roster with status 'invited'. Note: this does NOT
+  // create a real login for them — actually sending an invite email and
+  // creating the auth account requires Supabase's admin API (service-role
+  // key), which must run server-side (e.g. an Edge Function), never in the
+  // browser. Wire this up to call that function once you have one; until
+  // then this models "who's on the team" and their intended role/status.
+  async inviteTeamMember({ name, email, phone = '', role = 'agent' }) {
+    const payload = {
+      name: name.trim(),
+      email: email.trim().toLowerCase(),
+      phone: phone.trim() || null,
+      avatar_color: ['#0EA5A5', '#6D5EF5', '#F5A623', '#EF5A6F', '#2F86EB'][Math.floor(Math.random() * 5)],
+      role,
+      status: 'invited',
+    }
+    if (supabase) {
+      const { data, error } = await supabase.from('team_members').insert(payload).select().single()
+      throwIfError(error)
+      return mapTeamMember(data)
+    }
+    await wait(200)
+    const created = {
+      id: uid('tm'),
+      name: payload.name,
+      email: payload.email,
+      phone: payload.phone,
+      avatarColor: payload.avatar_color,
+      role: payload.role,
+      status: payload.status,
+      createdAt: new Date().toISOString(),
+    }
+    MOCK_TEAM_MEMBERS = [...MOCK_TEAM_MEMBERS, created]
+    return created
+  },
+
+  // patch can include { role, status, name, phone } — used for both the role
+  // dropdown and "resend invite" / "suspend" / "reactivate" actions.
+  async updateTeamMember(memberId, patch) {
+    if (supabase) {
+      const dbPatch = {}
+      if (patch.role !== undefined) dbPatch.role = patch.role
+      if (patch.status !== undefined) dbPatch.status = patch.status
+      if (patch.name !== undefined) dbPatch.name = patch.name
+      if (patch.phone !== undefined) dbPatch.phone = patch.phone
+      const { data, error } = await supabase.from('team_members').update(dbPatch).eq('id', memberId).select().single()
+      throwIfError(error)
+      return mapTeamMember(data)
+    }
+    await wait(150)
+    MOCK_TEAM_MEMBERS = MOCK_TEAM_MEMBERS.map((m) => (m.id === memberId ? { ...m, ...patch } : m))
+    return MOCK_TEAM_MEMBERS.find((m) => m.id === memberId)
+  },
+
+  async removeTeamMember(memberId) {
+    if (supabase) {
+      const { error } = await supabase.from('team_members').delete().eq('id', memberId)
+      throwIfError(error)
+      return true
+    }
+    await wait(150)
+    MOCK_TEAM_MEMBERS = MOCK_TEAM_MEMBERS.filter((m) => m.id !== memberId)
+    return true
   },
 }
