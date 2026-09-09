@@ -18,8 +18,15 @@ export function AuthProvider({ children }) {
   useEffect(() => {
     if (!supabase) return // no Supabase configured — demo user is already set
 
-    supabase.auth.getSession().then(({ data }) => {
-      setUser(data.session?.user ?? null)
+    supabase.auth.getSession().then(async ({ data, error }) => {
+      const session = data?.session
+      const authFailure = error || (session && (await supabase.auth.getUser(session.access_token)).error)
+      if (authFailure?.status === 401 || authFailure?.message?.includes('JWT issued at future')) {
+        await supabase.auth.signOut({ scope: 'local' }).catch(() => { })
+        setUser(null)
+      } else if (!authFailure) {
+        setUser(session?.user ?? null)
+      }
       setLoading(false)
     })
 
